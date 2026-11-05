@@ -55,3 +55,29 @@ menu "Example Configuration"
             Define el periodo de parpadeo en milisegundos.
 
 endmenu
+
+menu "Sensor Network Configuration"
+
+    config SENSOR_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Nombre de la red Wi-Fi a la que se conectara el ESP32.
+
+    config SENSOR_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Contrasena de la red Wi-Fi.
+
+    config SENSOR_POST_URL
+        string "Temperature endpoint URL"
+        default "https://thingsonline.net/api/sensors/temperature"
+
+    config SENSOR_API_KEY
+        string "API key"
+        default ""
+        help
+            Clave enviada en el encabezado HTTP x-api-key.
+
+endmenu
