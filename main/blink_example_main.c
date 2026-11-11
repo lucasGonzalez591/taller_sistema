@@ -10,16 +10,28 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "esp_crt_bundle.h"
 #include "esp_err.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_netif_ip_addr.h"
+#include "esp_netif_sntp.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "led_strip.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "esp_wifi.h"
 
 /* Identificador usado para agrupar los mensajes de registro de esta aplicacion. */
 static const char *ETIQUETA = "sensor_lcd";
@@ -38,14 +50,220 @@ static const char *ETIQUETA = "sensor_lcd";
 
 /* Periodo minimo recomendado entre lecturas del DHT22. */
 #define DHT22_INTERVALO_US 2000000LL
+#define POST_INTERVALO_US 60000000LL
 #define DHT22_TIEMPO_ESPERA_US 120
+#define WIFI_CONECTADO_BIT BIT0
 
 /* Estado compartido por el control del LED y la pantalla. */
 static bool estado_led = false;
 static i2c_master_dev_handle_t dispositivo_lcd;
+static EventGroupHandle_t eventos_wifi;
+static QueueHandle_t cola_temperaturas;
 #ifdef CONFIG_BLINK_LED_STRIP
 static led_strip_handle_t tira_led;
 #endif
+
+/* Gestiona la conexion inicial y los reintentos de la estacion Wi-Fi. */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *datos)
+{
+    (void)arg;
+    (void)datos;
+
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_err_t resultado = esp_wifi_connect();
+        if (resultado != ESP_OK) {
+            ESP_LOGE(ETIQUETA, "No se pudo iniciar la conexion Wi-Fi: %s",
+                     esp_err_to_name(resultado));
+        }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(eventos_wifi, WIFI_CONECTADO_BIT);
+        wifi_event_sta_disconnected_t *evento = datos;
+        ESP_LOGW(ETIQUETA, "Wi-Fi desconectado (motivo %u); se intentara reconectar",
+                 evento->reason);
+        esp_err_t resultado = esp_wifi_connect();
+        if (resultado != ESP_OK) {
+            ESP_LOGE(ETIQUETA, "Fallo el reintento de conexion Wi-Fi: %s",
+                     esp_err_to_name(resultado));
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *evento = datos;
+        xEventGroupSetBits(eventos_wifi, WIFI_CONECTADO_BIT);
+        ESP_LOGI(ETIQUETA, "Wi-Fi conectado: IP=" IPSTR ", gateway=" IPSTR,
+                 IP2STR(&evento->ip_info.ip), IP2STR(&evento->ip_info.gw));
+    }
+}
+
+typedef struct {
+    char cuerpo[256];
+    size_t longitud;
+    bool truncado;
+} respuesta_http_t;
+
+static esp_err_t capturar_respuesta_http(esp_http_client_event_t *evento)
+{
+    if (evento == NULL || evento->user_data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (evento->event_id == HTTP_EVENT_ON_DATA && evento->data != NULL &&
+        evento->data_len > 0) {
+        respuesta_http_t *respuesta = evento->user_data;
+        size_t disponible = sizeof(respuesta->cuerpo) - 1 - respuesta->longitud;
+        size_t longitud_datos = (size_t)evento->data_len;
+        size_t copiar = longitud_datos < disponible ? longitud_datos : disponible;
+        memcpy(respuesta->cuerpo + respuesta->longitud, evento->data, copiar);
+        respuesta->longitud += copiar;
+        respuesta->cuerpo[respuesta->longitud] = '\0';
+        respuesta->truncado = respuesta->truncado || copiar < longitud_datos;
+    }
+
+    return ESP_OK;
+}
+
+/* Inicializa NVS, la interfaz de red y la estacion Wi-Fi. */
+static void configurar_wifi(void)
+{
+    esp_err_t resultado = nvs_flash_init();
+    if (resultado == ESP_ERR_NVS_NO_FREE_PAGES || resultado == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        resultado = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(resultado);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_sntp_config_t configuracion_sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&configuracion_sntp));
+    if (esp_netif_create_default_wifi_sta() == NULL) {
+        ESP_LOGE(ETIQUETA, "No se pudo crear la interfaz Wi-Fi");
+        abort();
+    }
+
+    eventos_wifi = xEventGroupCreate();
+    if (eventos_wifi == NULL) {
+        ESP_LOGE(ETIQUETA, "No se pudo crear el grupo de eventos Wi-Fi");
+        abort();
+    }
+
+    wifi_init_config_t configuracion_inicial = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&configuracion_inicial));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               wifi_event_handler, NULL));
+
+    wifi_config_t configuracion_wifi = {
+        .sta = {
+            .ssid = CONFIG_SENSOR_WIFI_SSID,
+            .password = CONFIG_SENSOR_WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    if (CONFIG_SENSOR_WIFI_SSID[0] == '\0' || CONFIG_SENSOR_WIFI_PASSWORD[0] == '\0' ||
+        CONFIG_SENSOR_API_KEY[0] == '\0') {
+        ESP_LOGE(ETIQUETA, "Configura SSID, contrasena Wi-Fi y clave API en Sensor Network Configuration");
+        abort();
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &configuracion_wifi));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* Envia la temperatura medida y registra en el monitor el resultado del POST. */
+static void enviar_temperatura(int16_t temperatura_decimas)
+{
+    if ((xEventGroupGetBits(eventos_wifi) & WIFI_CONECTADO_BIT) == 0) {
+        ESP_LOGW(ETIQUETA, "No se envia la lectura: Wi-Fi no esta conectado");
+        return;
+    }
+
+    time_t ahora;
+    time(&ahora);
+    if (ahora < 1577836800) {
+        ESP_LOGW(ETIQUETA, "Se espera la hora de SNTP antes de validar el certificado HTTPS");
+        return;
+    }
+
+    char cuerpo[160];
+    int temperatura_absoluta = abs(temperatura_decimas);
+    int longitud = snprintf(cuerpo, sizeof(cuerpo),
+                            "{\"sensor_id\":\"gonzalez\",\"temperature\":%s%d.%d,"
+                            "\"location\":\"laboratorio 2\"}",
+                            temperatura_decimas < 0 ? "-" : "",
+                            temperatura_absoluta / 10, temperatura_absoluta % 10);
+    if (longitud < 0 || (size_t)longitud >= sizeof(cuerpo)) {
+        ESP_LOGE(ETIQUETA, "No se pudo construir el JSON de temperatura");
+        return;
+    }
+
+    respuesta_http_t respuesta = {0};
+    esp_http_client_config_t configuracion_http = {
+        .url = CONFIG_SENSOR_POST_URL,
+        .event_handler = capturar_respuesta_http,
+        .user_data = &respuesta,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 10000,
+    };
+    esp_http_client_handle_t cliente = esp_http_client_init(&configuracion_http);
+    if (cliente == NULL) {
+        ESP_LOGE(ETIQUETA, "No se pudo inicializar el cliente HTTPS");
+        return;
+    }
+
+    esp_err_t resultado = esp_http_client_set_method(cliente, HTTP_METHOD_POST);
+    if (resultado == ESP_OK) {
+        resultado = esp_http_client_set_header(cliente, "Content-Type", "application/json");
+    }
+    if (resultado == ESP_OK) {
+        resultado = esp_http_client_set_header(cliente, "x-api-key", CONFIG_SENSOR_API_KEY);
+    }
+    if (resultado == ESP_OK) {
+        resultado = esp_http_client_set_post_field(cliente, cuerpo, longitud);
+    }
+    if (resultado != ESP_OK) {
+        ESP_LOGE(ETIQUETA, "No se pudo preparar el POST: %s", esp_err_to_name(resultado));
+        esp_http_client_cleanup(cliente);
+        return;
+    }
+
+    ESP_LOGI(ETIQUETA, "Enviando POST de temperatura: %s", cuerpo);
+    resultado = esp_http_client_perform(cliente);
+    if (resultado == ESP_OK) {
+        int codigo_http = esp_http_client_get_status_code(cliente);
+        if (codigo_http >= 200 && codigo_http < 300) {
+            ESP_LOGI(ETIQUETA, "POST completado correctamente (HTTP %d)", codigo_http);
+        } else {
+            ESP_LOGE(ETIQUETA, "El servidor respondio al POST con HTTP %d; cuerpo: %.*s%s",
+                     codigo_http, (int)respuesta.longitud, respuesta.cuerpo,
+                     respuesta.truncado ? " [truncado]" : "");
+        }
+    } else {
+        int socket_errno = esp_http_client_get_errno(cliente);
+        int tls_error = 0;
+        int tls_flags = 0;
+        esp_err_t tls_result = esp_http_client_get_and_clear_last_tls_error(
+            cliente, &tls_error, &tls_flags);
+        const char *socket_mensaje = socket_errno > 0 ? strerror(socket_errno) : "no disponible";
+        ESP_LOGE(ETIQUETA,
+                 "Fallo el POST HTTPS: %s; socket errno=%d (%s), TLS error=0x%x, "
+                 "cert flags=0x%x, detalle TLS=%s",
+                 esp_err_to_name(resultado), socket_errno, socket_mensaje,
+                 tls_error, tls_flags, esp_err_to_name(tls_result));
+    }
+    esp_http_client_cleanup(cliente);
+}
+
+/* Aisla las operaciones HTTPS para que la pantalla y el LED sigan actualizandose. */
+static void tarea_envio_temperatura(void *arg)
+{
+    (void)arg;
+    int16_t temperatura_decimas;
+    while (true) {
+        if (xQueueReceive(cola_temperaturas, &temperatura_decimas, portMAX_DELAY) == pdTRUE) {
+            enviar_temperatura(temperatura_decimas);
+        }
+    }
+}
 
 /* Escribe un byte en el expansor I2C conectado al LCD. */
 static void lcd_escribir_byte(uint8_t valor)
@@ -273,11 +491,23 @@ void app_main(void)
     int16_t humedad_decimas = 0;
     bool lectura_correcta = false;
     int64_t ultima_lectura_us = -DHT22_INTERVALO_US;
+    int64_t ultimo_post_us = -POST_INTERVALO_US;
     TickType_t instante_anterior = xTaskGetTickCount();
 
     inicializar_led();
     configurar_dht22();
     configurar_lcd();
+    configurar_wifi();
+
+    cola_temperaturas = xQueueCreate(1, sizeof(temperatura_decimas));
+    if (cola_temperaturas == NULL) {
+        ESP_LOGE(ETIQUETA, "No se pudo crear la cola de temperaturas");
+        abort();
+    }
+    if (xTaskCreate(tarea_envio_temperatura, "http_post", 8192, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(ETIQUETA, "No se pudo iniciar la tarea de envio HTTPS");
+        abort();
+    }
 
     while (true) {
         int64_t tiempo_actual_us = esp_timer_get_time();
@@ -286,6 +516,17 @@ void app_main(void)
             ultima_lectura_us = tiempo_actual_us;
             if (resultado == ESP_OK) {
                 lectura_correcta = true;
+                ESP_LOGI(ETIQUETA, "DHT22: temperatura=%s%d.%d C, humedad=%d.%d%%",
+                         temperatura_decimas < 0 ? "-" : "",
+                         abs(temperatura_decimas) / 10, abs(temperatura_decimas) % 10,
+                         humedad_decimas / 10, humedad_decimas % 10);
+                if (tiempo_actual_us - ultimo_post_us >= POST_INTERVALO_US) {
+                    if (xQueueOverwrite(cola_temperaturas, &temperatura_decimas) != pdPASS) {
+                        ESP_LOGE(ETIQUETA, "No se pudo encolar la temperatura para envio");
+                    } else {
+                        ultimo_post_us = tiempo_actual_us;
+                    }
+                }
             } else {
                 ESP_LOGW(ETIQUETA, "No se pudo leer el DHT22: %s", esp_err_to_name(resultado));
             }

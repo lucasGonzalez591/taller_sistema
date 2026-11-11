@@ -39,6 +39,18 @@ Run `idf.py -p PORT flash monitor` to build, flash and monitor the project.
 
 (To exit the serial monitor, type ``Ctrl-]``.)
 
+## Envio de temperatura por HTTPS
+
+El ESP32 se conecta a la red Wi-Fi configurada y envia una lectura valida de temperatura
+cada minuto mediante un POST JSON al endpoint HTTPS. La humedad sigue mostrandose en la pantalla
+LCD y en el monitor serie; el POST contiene `sensor_id`, `temperature` y `location`.
+El certificado TLS se valida con el paquete de certificados de ESP-IDF y la hora se
+sincroniza por SNTP.
+
+En `idf.py menuconfig`, configura SSID, contrasena y clave API en **Sensor Network
+Configuration**. El SSID, la contrasena y la clave se guardan en `sdkconfig`, que no
+se versiona. El monitor serie muestra el JSON enviado y el codigo HTTP de respuesta.
+
 See the [Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html) for full steps to configure and use ESP-IDF to build projects.
 
 ## Example Output
